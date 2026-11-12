@@ -1,3 +1,5 @@
+import os
+
 import torch
 
 from ._base import _SteerBase
@@ -271,20 +273,225 @@ class SafeSwitchTrainer(_SteerBase):
         )
 
 
-class CircuitBreakerTrainer(_SteerBase):
+def _warn_calibrate_ignores_data(trainer, harmful, harmless) -> None:
+    if harmful is not None or harmless is not None:
+        import warnings
+        warnings.warn(
+            f"{trainer.METHOD}.calibrate() only wraps the model and does not use the "
+            "harmful/harmless data; call fit(harmful=..., retain=...) to train the LoRA "
+            "adapter", stacklevel=4)
+
+
+def _scaled_points(model, points) -> list:
+    """Layer indices given for a 32-layer model, at the same relative depth in ``model``."""
+    n = len(_get_decoder_layers(model))
+    if not n or get_config().legacy_steer_layers:
+        return list(points)
+    return sorted({min(n - 1, round(p * n / _REF_DEPTH)) for p in points})
+
+
+class _RRFitMixin:
+    """``fit()`` plumbing shared by Circuit Breakers and RepBend."""
+
+    def _fit(self, harmful, retain, *, layers, step_loss, logits_mask, lora_layers,
+             out_dir, config, **loop):
+        from ._rr_training import run_rr_training
+        model, history, stats = run_rr_training(
+            model=self.model, tokenizer=self.tok, harmful=harmful, retain=retain,
+            layers=layers, step_loss=step_loss, logits_mask=logits_mask,
+            lora_layers=lora_layers, **loop)
+        self.history, self.data_stats = history, stats
+        self.model = model
+        if out_dir is not None:
+            import json
+            os.makedirs(out_dir, exist_ok=True)
+            model.save_pretrained(out_dir)
+            record = {"method": self.METHOD, "target_layers": list(layers),
+                      "lora_layers": lora_layers, "config": config,
+                      "fit": {k: v for k, v in loop.items() if k != "callback"},
+                      "data": stats, "history": history}
+            with open(os.path.join(out_dir, "rr_training.json"), "w") as handle:
+                json.dump(record, handle, indent=2, default=str)
+        return model
+
+
+class CircuitBreakerTrainer(_RRFitMixin, _SteerBase):
+    """Circuit Breakers (Zou et al. 2024, arXiv:2406.04313).
+
+    ``calibrate()`` returns the :class:`~safetune.steer.CircuitBreakerModel` wrapper
+    without training; ``fit()`` trains the LoRRA adapter on its RR loss.
+    ``target_layers=None`` uses the paper's Llama-3-8B layers (10, 20) scaled to the
+    model's depth; LoRA covers blocks ``0..max(target_layers)`` unless ``lora_layers``
+    is given, as in ``GraySwanAI/circuit-breakers``.
+    """
+
     METHOD = "CircuitBreakerTrainer"
 
+    def __init__(self, model=None, tokenizer=None, *, target_layers=None,
+                 rr_alpha: float = 5.0, rr_schedule_steps: int = 300, **kwargs):
+        super().__init__(model, tokenizer, **kwargs)
+        self.target_layers = target_layers
+        self.rr_alpha = rr_alpha
+        self.rr_schedule_steps = rr_schedule_steps
+
+    def _wrapper(self, model, layers=None):
+        return S.CircuitBreakerModel(model, target_layers=layers, rr_alpha=self.rr_alpha,
+                                     rr_schedule_steps=self.rr_schedule_steps)
+
     def _do_calibrate(self, harmful=None, harmless=None, *, calib_n: int = 256,
                   **kwargs):
-        return S.CircuitBreakerModel(self.model)
+        _warn_calibrate_ignores_data(self, harmful, harmless)
+        return self._wrapper(self.model, self.target_layers)
+
+    def fit(self, harmful, retain, *, max_steps: int = 150, batch_size: int = 2,
+            gradient_accumulation: int = 8, learning_rate: float = 1e-4,
+            warmup_steps: int = 10, max_grad_norm: float = 1.0, lora_r: int = 16,
+            lora_alpha: int = 16, lora_dropout: float = 0.05, lora_layers=None,
+            target_modules=("q_proj", "k_proj", "v_proj", "o_proj"), max_len: int = 1024,
+            chat_template: bool = True, gradient_checkpointing: bool = False, seed: int = 0,
+            log_every: int = 10, callback=None, out_dir: str = None):
+        """Train a LoRRA adapter on the RR loss and return the PEFT model.
+
+        ``harmful`` rows feed the circuit-breaker term and ``retain`` rows the retain
+        term; each is a list of prompt strings or ``{"prompt", "response"}`` dicts. A
+        harmful row's loss covers its response tokens (its prompt tokens when it has
+        no response); a retain row's covers every token. The frozen reference is the
+        same model with the adapter disabled, run in eval mode without gradients, so
+        ``self.model`` must not already carry a PEFT adapter. Each step draws
+        ``batch_size`` harmful and ``batch_size`` retain rows ``gradient_accumulation``
+        times. LoRA weights train in fp32; on CUDA a fp16/bf16 base runs under
+        autocast (fp16 with a GradScaler, which skips overflowed steps). Defaults
+        follow ``GraySwanAI/circuit-breakers`` (150 steps, lr 1e-4, r = alpha = 16,
+        schedule over 300 steps). The per-step log is kept in ``self.history`` and data
+        statistics in ``self.data_stats``; ``out_dir`` saves the adapter and
+        ``rr_training.json``. Warns when the circuit-breaker cosine never leaves 1.
+        """
+        from ._rr_training import check_layers, masked_mean_cos
+        layers = check_layers(self.model, self.target_layers if self.target_layers is not None
+                              else _scaled_points(self.model, [10, 20]))
+        wrapper = self._wrapper(self.model, layers)
+        if lora_layers is None:  # GraySwanAI/circuit-breakers: blocks 0..max(target_layers)
+            lora_layers = list(range(max(layers) + 1))
+
+        def step_loss(step, ref, lora, batch):
+            loss = wrapper.compute_rr_loss(ref["rt"][0], lora["rt"][0], ref["cb"][0],
+                                           lora["cb"][0], step=step,
+                                           retain_mask=batch["rt"]["attention_mask"],
+                                           cb_mask=batch["cb"]["target_mask"])
+            retain_coeff, cb_coeff = wrapper.rr_coefficients(step)
+            with torch.no_grad():
+                cos = masked_mean_cos(lora["cb"][0], ref["cb"][0], batch["cb"]["target_mask"])
+            return loss, {"retain_coeff": retain_coeff, "cb_coeff": cb_coeff, "cb_cos": cos}
+
+        model = self._fit(
+            harmful, retain, layers=layers, step_loss=step_loss, logits_mask=None,
+            lora_layers=lora_layers, out_dir=out_dir,
+            config={"rr_alpha": self.rr_alpha, "rr_schedule_steps": self.rr_schedule_steps},
+            max_steps=max_steps, batch_size=batch_size,
+            gradient_accumulation=gradient_accumulation, learning_rate=learning_rate,
+            warmup_steps=warmup_steps, max_grad_norm=max_grad_norm, lora_r=lora_r,
+            lora_alpha=lora_alpha, lora_dropout=lora_dropout, target_modules=target_modules,
+            max_len=max_len, chat_template=chat_template,
+            gradient_checkpointing=gradient_checkpointing, seed=seed, log_every=log_every,
+            callback=callback)
+        cos = [h["cb_cos"] for h in self.history]
+        if cos and min(cos) > 1 - 1e-4:
+            import warnings
+            warnings.warn(
+                f"CircuitBreakerTrainer.fit: the circuit-breaker cosine stayed at "
+                f">= {min(cos):.6f} for all {len(cos)} steps, so rerouting did not move the "
+                "harmful representations. relu(cos) has zero gradient at cos = 1, which is "
+                "where a zero-initialised LoRA adapter starts; check the adapter before "
+                "relying on it", stacklevel=2)
+        return model
 
 
-class RepBendTrainer(_SteerBase):
+class RepBendTrainer(_RRFitMixin, _SteerBase):
+    """RepBend (Yousefpour et al. 2025, arXiv:2504.01550).
+
+    ``calibrate()`` returns the :class:`~safetune.steer.RepBendModel` wrapper without
+    training; ``fit()`` trains a LoRA adapter on its five-term loss with per-token
+    masked norms and a padding-free KL (see ``RepBendModel.compute_repbend_loss``).
+    ``target_layers=None`` uses the wrapper's default band (blocks 8-23 of a 32-layer
+    model) scaled to the model's depth. ``unsafe_cap`` (default ``None``, the paper's
+    unbounded objective) optionally bounds the maximised unsafe term.
+    """
+
     METHOD = "RepBendTrainer"
 
+    def __init__(self, model=None, tokenizer=None, *, target_layers=None,
+                 loss_alpha: float = 1.0, loss_beta: float = 1.0, loss_gamma: float = 1.0,
+                 loss_epsilon: float = 1.0, kl_temperature: float = 2.0,
+                 unsafe_cap: float = None, **kwargs):
+        super().__init__(model, tokenizer, **kwargs)
+        self.target_layers = target_layers
+        self.loss_alpha, self.loss_beta, self.loss_gamma = loss_alpha, loss_beta, loss_gamma
+        self.loss_epsilon, self.kl_temperature = loss_epsilon, kl_temperature
+        self.unsafe_cap = unsafe_cap
+
+    def _wrapper(self, model, layers=None):
+        return S.RepBendModel(model, target_layers=layers, loss_alpha=self.loss_alpha,
+                              loss_beta=self.loss_beta, loss_gamma=self.loss_gamma,
+                              loss_epsilon=self.loss_epsilon,
+                              kl_temperature=self.kl_temperature, unsafe_cap=self.unsafe_cap)
+
     def _do_calibrate(self, harmful=None, harmless=None, *, calib_n: int = 256,
                   **kwargs):
-        return S.RepBendModel(self.model)
+        _warn_calibrate_ignores_data(self, harmful, harmless)
+        return self._wrapper(self.model, self.target_layers)
+
+    def fit(self, harmful, retain, *, max_steps: int = 150, batch_size: int = 2,
+            gradient_accumulation: int = 8, learning_rate: float = 1e-4,
+            warmup_steps: int = 10, max_grad_norm: float = 1.0, lora_r: int = 16,
+            lora_alpha: int = 16, lora_dropout: float = 0.05, lora_layers=None,
+            target_modules=("q_proj", "k_proj", "v_proj", "o_proj"), max_len: int = 1024,
+            chat_template: bool = True, gradient_checkpointing: bool = False, seed: int = 0,
+            log_every: int = 10, callback=None, out_dir: str = None,
+            kl_positions: str = "all"):
+        """Train a LoRA adapter on the RepBend loss and return the PEFT model.
+
+        Same data, reference and arguments as :meth:`CircuitBreakerTrainer.fit`.
+        ``harmful`` rows are the unsafe set (their response tokens, or prompt tokens
+        when prompt-only, enter the unsafe and cosine terms); ``retain`` rows are the
+        safe set (all tokens enter the safe term and, when ``loss_epsilon > 0``, the
+        KL term). ``kl_positions="response"`` restricts the KL to retain response tokens,
+        which saves memory with large vocabularies but deviates from the repo (all
+        tokens). LoRA covers every block unless ``lora_layers`` is given. The per-term
+        values of every step are kept in ``self.history``.
+        """
+        if kl_positions not in ("all", "response"):
+            raise ValueError("kl_positions must be 'all' or 'response'")
+        from ._rr_training import check_layers
+        layers = check_layers(self.model, self.target_layers if self.target_layers is not None
+                              else _default_layers(self.model, range(8, 24)))
+        wrapper = self._wrapper(self.model, layers)
+        logits_mask = None
+        if self.loss_epsilon > 0:
+            logits_mask = "attention_mask" if kl_positions == "all" else "response_mask"
+
+        def step_loss(step, ref, lora, batch):
+            rt_mask = batch["rt"]["attention_mask"]
+            loss = wrapper.compute_repbend_loss(
+                lora["rt"][0], ref["rt"][0], lora["cb"][0], ref["cb"][0],
+                retain_logits=lora["rt"][1], orig_retain_logits=ref["rt"][1],
+                safe_mask=rt_mask, unsafe_mask=batch["cb"]["target_mask"],
+                kl_batch_size=rt_mask.shape[0])
+            return loss, dict(wrapper.last_loss_terms)
+
+        return self._fit(
+            harmful, retain, layers=layers, step_loss=step_loss, logits_mask=logits_mask,
+            lora_layers=lora_layers, out_dir=out_dir,
+            config={"kl_positions": kl_positions, "loss_alpha": self.loss_alpha,
+                    "loss_beta": self.loss_beta, "loss_gamma": self.loss_gamma,
+                    "loss_epsilon": self.loss_epsilon,
+                    "kl_temperature": self.kl_temperature, "unsafe_cap": self.unsafe_cap},
+            max_steps=max_steps, batch_size=batch_size,
+            gradient_accumulation=gradient_accumulation, learning_rate=learning_rate,
+            warmup_steps=warmup_steps, max_grad_norm=max_grad_norm, lora_r=lora_r,
+            lora_alpha=lora_alpha, lora_dropout=lora_dropout, target_modules=target_modules,
+            max_len=max_len, chat_template=chat_template,
+            gradient_checkpointing=gradient_checkpointing, seed=seed, log_every=log_every,
+            callback=callback)
 
 
 class TARSteerTrainer(_SteerBase):

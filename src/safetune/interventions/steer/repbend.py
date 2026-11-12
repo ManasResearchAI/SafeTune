@@ -120,6 +120,12 @@ class RepBendModel:
         term needs paired data.
     kl_temperature
         Temperature for the KL retain term (repo default 2.0).
+    unsafe_cap
+        Optional upper bound on the unsafe term before it is subtracted
+        (``min(unsafe_loss, unsafe_cap)``). ``None`` (default) is the paper's
+        unbounded objective. The unsafe term is *maximised*, so without a bound
+        it can grow without limit and dominate the loss; a cap is a stability
+        deviation from the paper and is off unless requested.
     capture_hook
         If ``True``, register the legacy diagnostic activation-capture hook.
         This is **not** RepBend's mechanism and applies nothing to outputs;
@@ -139,6 +145,7 @@ class RepBendModel:
         loss_epsilon: float = 1.0,
         loss_eta: float = 0.0,
         kl_temperature: float = 2.0,
+        unsafe_cap: Optional[float] = None,
         capture_hook: bool = False,
     ) -> None:
         if _IMPORT_ERROR is not None:
@@ -161,7 +168,12 @@ class RepBendModel:
         self.loss_epsilon = float(loss_epsilon)
         self.loss_eta = float(loss_eta)
         self.kl_temperature = float(kl_temperature)
+        if unsafe_cap is not None and not unsafe_cap > 0:
+            raise ValueError("unsafe_cap must be a positive number or None")
+        self.unsafe_cap = None if unsafe_cap is None else float(unsafe_cap)
         self.bending_strength = float(bending_strength)
+        # Per-term values of the last compute_repbend_loss call (floats), for logging.
+        self.last_loss_terms: Dict[str, float] = {}
 
         # Stored for diagnostics only — NOT used by the faithful loss.
         self.safe_directions = safe_directions
@@ -188,6 +200,11 @@ class RepBendModel:
         orig_retain_logits: Optional[Any] = None,
         unsafe_response_hidden: Optional[Dict[int, Any]] = None,
         safe_response_target_hidden: Optional[Dict[int, Any]] = None,
+        *,
+        safe_mask: Optional[Any] = None,
+        unsafe_mask: Optional[Any] = None,
+        retain_mask: Optional[Any] = None,
+        kl_batch_size: Optional[int] = None,
     ) -> Any:
         """Faithful RepBend fine-tuning loss (arXiv:2504.01550, ``_calc_loss``).
 
@@ -226,6 +243,24 @@ class RepBendModel:
             prompt, and the frozen-model hidden states of the *safe* response
             to that same unsafe prompt.  Their L2 difference is the
             ``safe_unsafe_loss`` term.  Optional (needs ``loss_eta > 0``).
+        safe_mask, unsafe_mask
+            Optional ``(batch, seq)`` token masks for ``(batch, seq, dim)``
+            hidden states. When given, the safe / unsafe terms are the mean
+            per-token L2 norm over the masked tokens, as in the repo's
+            ``_calc_loss`` (``norm(...).sum() / mask.sum()``), so padding never
+            enters the loss; the cosine term pools the masked tokens. Without a
+            mask, ``(batch, seq, dim)`` inputs are token-mean pooled first
+            (the previous behaviour, which averages over padding).
+        retain_mask
+            Optional ``(batch, seq)`` mask for ``(batch, seq, vocab)`` retain
+            logits. Masked-out positions are excluded and the KL is summed over
+            the remaining tokens and divided by the batch size, which equals the
+            repo's ``kl_div(..., reduction="batchmean")`` on mask-zeroed logits.
+        kl_batch_size
+            For retain logits already reduced to the kept token rows
+            ``(n_tokens, vocab)`` of a batch of ``kl_batch_size`` sequences: the
+            summed KL is divided by ``kl_batch_size``, the same value as the
+            ``retain_mask`` form without materialising padded positions.
 
         Returns
         -------
@@ -238,11 +273,26 @@ class RepBendModel:
         except ImportError:  # pragma: no cover
             raise ImportError("RepBend requires PyTorch.")
 
-        def _pool(t: Any) -> Any:
-            # Reduce (batch, seq, dim) -> (batch, dim) by token-mean; leave
-            # already-pooled (batch, dim) tensors untouched.
+        def _pool(t: Any, mask: Optional[Any] = None) -> Any:
+            # Reduce (batch, seq, dim) -> (batch, dim) by token-mean (over the
+            # masked tokens when a mask is given); leave already-pooled
+            # (batch, dim) tensors untouched.
             t = t.float()
-            return t.mean(dim=1) if t.dim() == 3 else t
+            if t.dim() != 3:
+                return t
+            if mask is None:
+                return t.mean(dim=1)
+            m = mask.to(t.dtype).unsqueeze(-1)
+            return (t * m).sum(dim=1) / m.sum(dim=1).clamp_min(1.0)
+
+        def _distance(a: Any, b: Any, mask: Optional[Any]) -> Any:
+            # Mean L2 distance. With a mask: per-token norms averaged over the
+            # masked tokens (repo-faithful); otherwise over pooled vectors.
+            if mask is not None and a.dim() == 3:
+                m = mask.to(torch.float)
+                per_token = (a.float() - b.float()).norm(p=2, dim=-1)  # (B, S)
+                return (per_token * m).sum() / m.sum().clamp_min(1.0)
+            return (_pool(a) - _pool(b)).norm(p=2, dim=-1).mean()
 
         def _common_layers(a: Dict[int, Any], b: Dict[int, Any]) -> List[int]:
             return [l for l in self.target_layers if l in a and l in b] or [
@@ -264,8 +314,7 @@ class RepBendModel:
         if s_layers:
             acc = zero
             for l in s_layers:
-                v_s = _pool(safe_hidden[l]) - _pool(orig_safe_hidden[l])
-                acc = acc + v_s.norm(p=2, dim=-1).mean()
+                acc = acc + _distance(safe_hidden[l], orig_safe_hidden[l], safe_mask)
             safe_loss = acc / len(s_layers)
 
         # ── unsafe_loss: mean ||v_u|| = ||M'(unsafe) - M(unsafe)|| ────
@@ -275,9 +324,11 @@ class RepBendModel:
         if u_layers:
             acc = zero
             for l in u_layers:
-                v_u = _pool(unsafe_hidden[l]) - _pool(orig_unsafe_hidden[l])
-                acc = acc + v_u.norm(p=2, dim=-1).mean()
+                acc = acc + _distance(unsafe_hidden[l], orig_unsafe_hidden[l], unsafe_mask)
             unsafe_loss = acc / len(u_layers)
+        bounded_unsafe = unsafe_loss
+        if self.unsafe_cap is not None:
+            bounded_unsafe = torch.clamp(unsafe_loss, max=self.unsafe_cap)
 
         # ── cosine_loss: 1 - mean pairwise cos_sim of unsafe reps ─────
         # Encourages harmful representations to collapse together so the
@@ -287,7 +338,7 @@ class RepBendModel:
             acc = zero
             n = 0
             for l in u_layers:
-                h = _pool(unsafe_hidden[l])              # (B, D)
+                h = _pool(unsafe_hidden[l], unsafe_mask)  # (B, D)
                 if h.shape[0] < 2:
                     continue
                 hn = h / (h.norm(dim=-1, keepdim=True) + 1e-8)
@@ -306,9 +357,20 @@ class RepBendModel:
             and orig_retain_logits is not None
         ):
             temp = self.kl_temperature
-            p = F.log_softmax(retain_logits.float() / temp, dim=-1)
-            q = F.softmax(orig_retain_logits.float() / temp, dim=-1)
-            kl_loss = F.kl_div(p, q, reduction="batchmean") * (temp ** 2)
+            lora_l, orig_l = retain_logits.float(), orig_retain_logits.float()
+            if kl_batch_size is not None:
+                p = F.log_softmax(lora_l / temp, dim=-1)
+                q = F.softmax(orig_l / temp, dim=-1)
+                kl_loss = F.kl_div(p, q, reduction="sum") / kl_batch_size * (temp ** 2)
+            elif retain_mask is not None and lora_l.dim() == 3:
+                keep = retain_mask.bool()
+                p = F.log_softmax(lora_l[keep] / temp, dim=-1)
+                q = F.softmax(orig_l[keep] / temp, dim=-1)
+                kl_loss = F.kl_div(p, q, reduction="sum") / lora_l.shape[0] * (temp ** 2)
+            else:
+                p = F.log_softmax(lora_l / temp, dim=-1)
+                q = F.softmax(orig_l / temp, dim=-1)
+                kl_loss = F.kl_div(p, q, reduction="batchmean") * (temp ** 2)
 
         # ── safe_unsafe_loss: bend unsafe-prompt response toward safe ─
         safe_unsafe_loss = zero
@@ -333,11 +395,20 @@ class RepBendModel:
         # ── verbatim aggregation (RepBend repo, _calc_loss) ───────────
         loss = (
             self.loss_alpha * safe_loss
-            - self.loss_beta * unsafe_loss
+            - self.loss_beta * bounded_unsafe
             + self.loss_gamma * cosine_loss
             + self.loss_epsilon * kl_loss
             + self.loss_eta * safe_unsafe_loss
         )
+        self.last_loss_terms = {
+            "safe_loss": float(safe_loss.detach()),
+            "unsafe_loss": float(unsafe_loss.detach()),
+            "cosine_loss": float(cosine_loss.detach()),
+            "kl_loss": float(kl_loss.detach()),
+            "safe_unsafe_loss": float(safe_unsafe_loss.detach()),
+            "unsafe_capped": float(bool(self.unsafe_cap is not None
+                                        and unsafe_loss.item() >= self.unsafe_cap)),
+        }
         return loss
 
     # ── pass-through generation (RepBend applies nothing at inference) ──
