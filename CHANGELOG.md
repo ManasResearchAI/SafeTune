@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `CircuitBreakerTrainer.fit(harmful, retain)` and `RepBendTrainer.fit(harmful, retain)` train
+  the LoRA adapter on each method's loss. Until now `calibrate()` only wrapped the model and
+  ignored the harmful/harmless data, so neither trainer trained anything. The frozen reference
+  is the model with the adapter disabled (eval mode, no gradients). The loss covers harmful
+  response tokens and all retain tokens, and Circuit Breakers' LoRA spans blocks
+  `0..max(target_layers)`, as in `GraySwanAI/circuit-breakers`. `calibrate()` keeps its
+  behaviour but now warns when it is given data it ignores. `CircuitBreakerTrainer.fit` warns
+  when the circuit-breaker cosine never leaves 1, the zero-gradient start of a zero-initialised
+  adapter.
+- `RepBendModel.compute_repbend_loss` takes optional `safe_mask` / `unsafe_mask` / `retain_mask`.
+  With masks, the safe and unsafe terms are per-token L2 norms over the masked tokens and the
+  KL excludes padding with `batchmean` normalisation, matching the RepBend repo's `_calc_loss`.
+  Without masks, the result is unchanged (token-mean pooled, including padding). New opt-in
+  `unsafe_cap` bounds the maximised unsafe term (a stability deviation from the paper; `None`
+  by default), `kl_batch_size` takes the KL over pre-selected token rows without materialising
+  padded positions, and `last_loss_terms` exposes each term of the last call.
+  `RepBendTrainer.fit(kl_positions="response")` limits the KL to retain response tokens to save
+  memory with large vocabularies (the repo uses all tokens, the default).
 - `trl` is capped below 1.15. TRL 1.15.0 (8 Oct 2026) computes the DPO loss with a
   Triton kernel and does not check that the tensors are on a GPU, so on a Linux
   machine without one the DPO-based trainers (CST, DeRTa and the rest of that

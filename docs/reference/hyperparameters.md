@@ -372,8 +372,8 @@ only `.calibrate()` (see [Shared parameters](#steer)).
 | `CASTTrainer` | `behavior_layers=None`, `alpha=1.0`, `per_prompt_gate=None` | Conditional activation steering. `per_prompt_gate` (default: on) gates and steers each prompt of a batch independently rather than letting one prompt's gate decide for the whole batch. |
 | `AdaSteerTrainer` | `alpha=15.0`, `layers=None` | Adapts steering strength per input rather than applying a fixed strength uniformly. |
 | `SafeSwitchTrainer` | `gate_layer=None`, `threshold=0.5` | Trains a small safety classifier to gate generation at a chosen layer. |
-| `CircuitBreakerTrainer` | — | Requires no calibration data. |
-| `RepBendTrainer` | — | Requires no calibration data. |
+| `CircuitBreakerTrainer` | `target_layers=None`, `rr_alpha=5.0`, `rr_schedule_steps=300`; `fit(max_steps=150, batch_size=2, gradient_accumulation=8, learning_rate=1e-4, lora_r=16, lora_alpha=16)` | `fit(harmful, retain)` trains the LoRRA adapter; `calibrate()` only wraps. |
+| `RepBendTrainer` | `target_layers=None`, `loss_alpha=loss_beta=loss_gamma=loss_epsilon=1.0`, `kl_temperature=2.0`, `unsafe_cap=None`; `fit()` as `CircuitBreakerTrainer` | `fit(harmful, retain)` trains a LoRA adapter; `calibrate()` only wraps. |
 | `TARSteerTrainer` | — | Requires no calibration data. |
 | `RRFAEnsembleTrainer` | — | Ensembles multiple refusal-direction-based safeguards. |
 | `SafeSteerTrainer` | `alpha=15.0` | Extracts and applies a refusal direction as a single steering category. |
